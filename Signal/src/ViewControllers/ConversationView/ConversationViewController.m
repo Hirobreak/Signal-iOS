@@ -80,6 +80,7 @@
 #import <SignalServiceKit/OWSMessageManager.h>
 #import <SignalServiceKit/OWSMessageSender.h>
 #import <SignalServiceKit/OWSMessageUtils.h>
+#import <SignalServiceKit/OWSPrimaryStorage.h>
 #import <SignalServiceKit/OWSReadReceiptManager.h>
 #import <SignalServiceKit/OWSVerificationStateChangeMessage.h>
 #import <SignalServiceKit/SignalRecipient.h>
@@ -303,13 +304,17 @@ typedef enum : NSUInteger {
                                                  name:UIContentSizeCategoryDidChangeNotification
                                                object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(yapDatabaseModified:)
-                                                 name:YapDatabaseModifiedNotification
+                                             selector:@selector(uiDatabaseDidUpdateExternally:)
+                                                 name:OWSUIDatabaseConnectionDidUpdateExternallyNotification
                                                object:OWSPrimaryStorage.sharedManager.dbNotificationObject];
     [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(yapDatabaseModifiedExternally:)
-                                                 name:YapDatabaseModifiedExternallyNotification
-                                               object:nil];
+                                             selector:@selector(uiDatabaseWillUpdate:)
+                                                 name:OWSUIDatabaseConnectionWillUpdateNotification
+                                               object:OWSPrimaryStorage.sharedManager.dbNotificationObject];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(uiDatabaseDidUpdate:)
+                                                 name:OWSUIDatabaseConnectionDidUpdateNotification
+                                               object:OWSPrimaryStorage.sharedManager.dbNotificationObject];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(applicationWillEnterForeground:)
                                                  name:OWSApplicationWillEnterForegroundNotification
@@ -3096,14 +3101,7 @@ typedef enum : NSUInteger {
 
 - (YapDatabaseConnection *)uiDatabaseConnection
 {
-    NSAssert([NSThread isMainThread], @"Must access uiDatabaseConnection on main thread!");
-    if (!_uiDatabaseConnection) {
-        _uiDatabaseConnection = [self.primaryStorage newDatabaseConnection];
-        // Increase object cache limit. Default is 250.
-        _uiDatabaseConnection.objectCacheLimit = 500;
-        [_uiDatabaseConnection beginLongLivedReadTransaction];
-    }
-    return _uiDatabaseConnection;
+    return OWSPrimaryStorage.sharedManager.uiDatabaseConnection;
 }
 
 - (YapDatabaseConnection *)editingDatabaseConnection
@@ -3114,7 +3112,7 @@ typedef enum : NSUInteger {
     return _editingDatabaseConnection;
 }
 
-- (void)yapDatabaseModifiedExternally:(NSNotification *)notification
+- (void)uiDatabaseDidUpdateExternally:(NSNotification *)notification
 {
     OWSAssertIsOnMainThread();
 
@@ -3131,20 +3129,8 @@ typedef enum : NSUInteger {
     }
 }
 
-- (void)yapDatabaseModified:(NSNotification *)notification
+- (void)uiDatabaseWillUpdate:(NSNotification *)notification
 {
-    OWSAssertIsOnMainThread();
-
-    // Currently, we update thread and message state every time
-    // the database is modified.  That doesn't seem optimal, but
-    // in practice it's efficient enough.
-
-    if (!self.shouldObserveDBModifications) {
-        return;
-    }
-
-    DDLogVerbose(@"%@ %s", self.logTag, __PRETTY_FUNCTION__);
-
     // HACK to work around radar #28167779
     // "UICollectionView performBatchUpdates can trigger a crash if the collection view is flagged for layout"
     // more: https://github.com/PSPDFKit-labs/radar.apple.com/tree/master/28167779%20-%20CollectionViewBatchingIssue
@@ -3155,11 +3141,21 @@ typedef enum : NSUInteger {
     //       view items before they are updated.
     [self.collectionView layoutIfNeeded];
     // ENDHACK to work around radar #28167779
+}
 
-    // We need to `beginLongLivedReadTransaction` before we update our
-    // models in order to jump to the most recent commit.
-    NSArray *notifications = [self.uiDatabaseConnection beginLongLivedReadTransaction];
+- (void)uiDatabaseDidUpdate:(NSNotification *)notification
+{
+    OWSAssertIsOnMainThread();
 
+    if (!self.shouldObserveDBModifications) {
+        return;
+    }
+    
+    DDLogVerbose(@"%@ %s", self.logTag, __PRETTY_FUNCTION__);
+
+    NSArray *notifications = notification.userInfo[OWSUIDatabaseConnectionNotificationsKey];
+    OWSAssert([notifications isKindOfClass:[NSArray class]]);
+    
     [self updateBackButtonUnreadCount];
     [self updateNavigationBarSubtitleLabel];
 
@@ -4647,10 +4643,6 @@ typedef enum : NSUInteger {
     if (self.messageMappings != nil) {
         // Before we begin observing database modifications, make sure
         // our mapping and table state is up-to-date.
-        //
-        // We need to `beginLongLivedReadTransaction` before we update our
-        // mapping in order to jump to the most recent commit.
-        [self.uiDatabaseConnection beginLongLivedReadTransaction];
         [self extendRangeToIncludeUnobservedItems];
         [self.uiDatabaseConnection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
             [self.messageMappings updateWithTransaction:transaction];
